@@ -2,9 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from scipy.stats import poisson
-import google.generativeai as genai
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
+import google.generativeai as genai
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -12,19 +12,26 @@ warnings.filterwarnings('ignore')
 # KONFIGURACJA STRONY
 # ------------------------------
 st.set_page_config(page_title="AI Football Analyst Pro", layout="wide")
-st.title("🧠 Analityk Piłkarski AI + Rynki Bukmacherskie")
-st.caption("Dane z Football-Data.org | Raport AI przez Gemini")
+st.title("🧠 Zaawansowany Analityk Piłkarski + Gemini + Kupony")
+st.caption("Football-Data.org (wyniki) + API-Football (składy) | Model Poissona | Raport AI")
 
 # ------------------------------
-# 1. MAPY I STAŁE
+# 1. MAPY I ŚREDNIE LIGOWE
 # ------------------------------
-LEAGUE_MAP = {
+LEAGUE_MAP_FD = {
     "Premier League": "PL",
     "La Liga": "PD",
     "Bundesliga": "BL1",
     "Serie A": "SA",
     "Ligue 1": "FL1",
-    # W razie potrzeby dodaj kolejne ligi obsługiwane przez Football-Data.org
+}
+
+LEAGUE_MAP_API = {
+    "Premier League": 39,
+    "La Liga": 140,
+    "Bundesliga": 78,
+    "Serie A": 135,
+    "Ligue 1": 61,
 }
 
 LEAGUE_FACTORS = {
@@ -32,186 +39,211 @@ LEAGUE_FACTORS = {
     "Serie A": 0.9, "Ligue 1": 0.98
 }
 
-# Średnie ligowe dla kartek i rożnych (wartości przykładowe, można zastąpić danymi z API)
-LEAGUE_AVG_CARDS = 3.8   # średnia suma kartek na mecz
-LEAGUE_AVG_CORNERS = 9.5 # średnia suma rzutów rożnych na mecz
+LEAGUE_AVERAGES = {
+    "Premier League": {"cards": 3.8, "corners": 10.2},
+    "La Liga": {"cards": 4.2, "corners": 9.5},
+    "Bundesliga": {"cards": 3.5, "corners": 10.8},
+    "Serie A": {"cards": 4.5, "corners": 10.0},
+    "Ligue 1": {"cards": 3.9, "corners": 9.8},
+}
+
+# Lista kluczowych graczy (przykład)
+KEY_PLAYERS = {
+    "Paris Saint-Germain": ["Kylian Mbappé", "Ousmane Dembélé", "Marquinhos", "Gianluigi Donnarumma"],
+    "Olympique Lyonnais": ["Alexandre Lacazette", "Rayan Cherki", "Maxence Caqueret"],
+    "Manchester City": ["Erling Haaland", "Kevin De Bruyne", "Rodri", "Phil Foden"],
+    "Arsenal": ["Bukayo Saka", "Martin Ødegaard", "Declan Rice", "William Saliba"],
+    "Real Madrid": ["Vinícius Júnior", "Jude Bellingham", "Kylian Mbappé", "Antonio Rüdiger"],
+    "FC Barcelona": ["Robert Lewandowski", "Lamine Yamal", "Pedri", "Ronald Araújo"],
+    "Bayern Munich": ["Harry Kane", "Jamal Musiala", "Joshua Kimmich"],
+    "Borussia Dortmund": ["Serhou Guirassy", "Julian Brandt", "Nico Schlotterbeck"],
+    "Juventus": ["Dušan Vlahović", "Kenan Yıldız", "Gleison Bremer"],
+    "Inter": ["Lautaro Martínez", "Nicolò Barella", "Alessandro Bastoni"],
+    "AC Milan": ["Rafael Leão", "Christian Pulisic", "Theo Hernández"],
+}
 
 # ------------------------------
-# 2. FUNKCJE POBRANIA DANYCH Z API
+# 2. FUNKCJE POBIERANIA DANYCH
 # ------------------------------
-@st.cache_data(ttl=3600, show_spinner="Pobieram dane z Football-Data.org...")
-def fetch_team_stats(team_name, league_code, api_key):
-    """Pobiera średnie bramki zdobyte/stracone z ostatnich 5 meczów ligowych."""
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_team_stats_fd(team_name, league_code, api_key):
+    """Pobiera średnie bramki z ostatnich 5 meczów ligowych (Football-Data.org)"""
     if not api_key:
-        return None, "Brak klucza API Football-Data.org"
-    
+        return None
     headers = {'X-Auth-Token': api_key}
-    
-    # Krok 1: Pobranie listy drużyn w lidze
     teams_url = f"https://api.football-data.org/v4/competitions/{league_code}/teams"
     try:
         resp = requests.get(teams_url, headers=headers)
         resp.raise_for_status()
         teams = resp.json()['teams']
+        team_id = next((t['id'] for t in teams if team_name.lower() in t['name'].lower()), None)
+        if not team_id:
+            st.warning(f"Nie znaleziono {team_name} w Football-Data.org")
+            return None
     except Exception as e:
-        return None, f"Błąd pobierania drużyn: {e}"
-    
-    # Znajdź ID drużyny (porównanie z ignorowaniem wielkości liter)
-    team_id = None
-    for t in teams:
-        if team_name.lower() in t['name'].lower():
-            team_id = t['id']
-            break
-    if not team_id:
-        return None, f"Nie znaleziono drużyny '{team_name}'"
-    
-    # Krok 2: Pobranie ostatnich meczów
+        st.error(f"Błąd pobierania listy drużyn: {e}")
+        return None
+
     matches_url = f"https://api.football-data.org/v4/teams/{team_id}/matches"
     params = {'limit': 20, 'status': 'FINISHED'}
     try:
         resp = requests.get(matches_url, headers=headers, params=params)
         resp.raise_for_status()
         matches = resp.json()['matches']
+        league_matches = [m for m in matches if m['competition']['code'] == league_code]
+        if len(league_matches) < 5:
+            st.warning(f"Znaleziono tylko {len(league_matches)} meczów dla {team_name}")
+            if not league_matches:
+                return None
+        recent = league_matches[-5:]
+        goals_for, goals_against = [], []
+        df_matches = []
+        for m in recent:
+            is_home = m['homeTeam']['id'] == team_id
+            gf = m['score']['fullTime']['home'] if is_home else m['score']['fullTime']['away']
+            ga = m['score']['fullTime']['away'] if is_home else m['score']['fullTime']['home']
+            if gf is not None and ga is not None:
+                goals_for.append(gf)
+                goals_against.append(ga)
+            df_matches.append({
+                'date': m['utcDate'][:10],
+                'opponent': m['awayTeam']['name'] if is_home else m['homeTeam']['name'],
+                'gf': gf,
+                'ga': ga
+            })
+        return {
+            'avg_gf': round(np.mean(goals_for), 2) if goals_for else 1.4,
+            'avg_ga': round(np.mean(goals_against), 2) if goals_against else 1.4,
+            'recent_form': pd.DataFrame(df_matches)
+        }
     except Exception as e:
-        return None, f"Błąd pobierania meczów: {e}"
-    
-    # Filtruj tylko mecze ligowe zakończone
-    league_matches = []
-    for m in matches:
-        if m['competition']['code'] == league_code:
-            if m['score']['fullTime']['home'] is not None and m['score']['fullTime']['away'] is not None:
-                league_matches.append(m)
-    
-    if len(league_matches) < 3:
-        return None, f"Za mało meczów ligowych ({len(league_matches)}) dla {team_name}"
-    
-    # Wybierz ostatnie 5 meczów
-    recent = league_matches[-5:]
-    
-    gf_list = []
-    ga_list = []
-    matches_data = []
-    for m in recent:
-        is_home = m['homeTeam']['id'] == team_id
-        gf = m['score']['fullTime']['home'] if is_home else m['score']['fullTime']['away']
-        ga = m['score']['fullTime']['away'] if is_home else m['score']['fullTime']['home']
-        opponent = m['awayTeam']['name'] if is_home else m['homeTeam']['name']
-        gf_list.append(gf)
-        ga_list.append(ga)
-        matches_data.append({
-            'date': m['utcDate'][:10],
-            'opponent': opponent,
-            'gf': gf,
-            'ga': ga
-        })
-    
-    avg_gf = np.mean(gf_list)
-    avg_ga = np.mean(ga_list)
-    
-    return {
-        'avg_xg': round(avg_gf, 2),     # Używamy rzeczywistych bramek jako proxy xG
-        'avg_xga': round(avg_ga, 2),
-        'possession': 50.0,             # API nie udostępnia
-        'ppda': 10.0,
-        'recent_form': pd.DataFrame(matches_data),
-        'url_found': True
-    }, None
+        st.error(f"Błąd pobierania meczów: {e}")
+        return None
+
+def get_upcoming_fixture(team_a, team_b, league_id, api_key):
+    """Znajduje nadchodzący mecz między dwiema drużynami (API-Football)"""
+    if not api_key:
+        return None
+    url = "https://v3.football.api-sports.io/fixtures"
+    headers = {'x-apisports-key': api_key}
+    today = datetime.now().strftime('%Y-%m-%d')
+    next_week = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
+    params = {
+        'league': league_id,
+        'season': datetime.now().year,
+        'from': today,
+        'to': next_week
+    }
+    try:
+        resp = requests.get(url, headers=headers, params=params)
+        data = resp.json()
+        for fix in data.get('response', []):
+            home = fix['teams']['home']['name']
+            away = fix['teams']['away']['name']
+            if (team_a.lower() in home.lower() or team_a.lower() in away.lower()) and \
+               (team_b.lower() in home.lower() or team_b.lower() in away.lower()):
+                return fix['fixture']['id']
+        return None
+    except Exception as e:
+        st.warning(f"Nie udało się pobrać ID meczu: {e}")
+        return None
+
+def fetch_lineup(fixture_id, team_name, api_key):
+    """Pobiera skład drużyny na dany mecz (API-Football)"""
+    if not fixture_id or not api_key:
+        return None
+    url = "https://v3.football.api-sports.io/fixtures/lineups"
+    headers = {'x-apisports-key': api_key}
+    params = {'fixture': fixture_id}
+    try:
+        resp = requests.get(url, headers=headers, params=params)
+        data = resp.json()
+        for lu in data.get('response', []):
+            if team_name.lower() in lu['team']['name'].lower():
+                return lu
+        return None
+    except:
+        return None
+
+def calculate_lineup_strength(lineup, key_players):
+    """Oblicza siłę składu (0.5-1.0) na podstawie obecności kluczowych graczy"""
+    if not lineup or not key_players:
+        return 1.0
+    starters = [p['player']['name'] for p in lineup['startXI']]
+    present = sum(1 for kp in key_players if any(kp.lower() in s.lower() for s in starters))
+    strength = 1.0 - (len(key_players) - present) * 0.1
+    return max(0.5, min(1.0, strength))
 
 # ------------------------------
-# 3. MODEL POISSONA DLA GOLI
+# 3. FUNKCJE OBLICZENIOWE (POISSON)
 # ------------------------------
-def poisson_goal_matrix(home_lambda, away_lambda, max_goals=6):
-    """Tworzy macierz prawdopodobieństw wyników."""
-    matrix = np.zeros((max_goals+1, max_goals+1))
-    for i in range(max_goals+1):
-        for j in range(max_goals+1):
-            matrix[i, j] = poisson.pmf(i, home_lambda) * poisson.pmf(j, away_lambda)
-    return matrix
+def calculate_match_probs(lambda_home, lambda_away):
+    home_win = draw = away_win = 0
+    for i in range(10):
+        for j in range(10):
+            prob = poisson.pmf(i, lambda_home) * poisson.pmf(j, lambda_away)
+            if i > j: home_win += prob
+            elif i == j: draw += prob
+            else: away_win += prob
+    return {"1": round(home_win*100,1), "X": round(draw*100,1), "2": round(away_win*100,1)}
 
-def calculate_match_probs(home_xg, away_xg, home_xga, away_xga, league_factor=1.0):
-    league_avg = 1.35 * league_factor
-    lambda_home = (home_xg / league_avg) * (away_xga / league_avg) * league_avg
-    lambda_away = (away_xg / league_avg) * (home_xga / league_avg) * league_avg * 0.95
-
-    matrix = poisson_goal_matrix(lambda_home, lambda_away)
-    
-    home_win = np.sum(np.tril(matrix, -1))  # suma poniżej przekątnej (home > away)
-    draw = np.sum(np.diag(matrix))
-    away_win = np.sum(np.triu(matrix, 1))
-    
-    likely_score = np.unravel_index(np.argmax(matrix), matrix.shape)
-    
+def calculate_goal_markets(lambda_home, lambda_away):
+    total = lambda_home + lambda_away
     return {
-        "home_win": round(home_win * 100, 1),
-        "draw": round(draw * 100, 1),
-        "away_win": round(away_win * 100, 1),
-        "likely_score": f"{likely_score[0]}-{likely_score[1]}",
-        "lambda_home": round(lambda_home, 2),
-        "lambda_away": round(lambda_away, 2),
-        "goal_matrix": matrix
+        'over_0.5': round((1-poisson.cdf(0,total))*100,1),
+        'over_1.5': round((1-poisson.cdf(1,total))*100,1),
+        'over_2.5': round((1-poisson.cdf(2,total))*100,1),
+        'over_3.5': round((1-poisson.cdf(3,total))*100,1),
+        'over_4.5': round((1-poisson.cdf(4,total))*100,1),
     }
 
-# ------------------------------
-# 4. RYNKI BUKMACHERSKIE
-# ------------------------------
-def calculate_markets(matrix, lambda_home, lambda_away, 
-                      lambda_cards=None, lambda_corners=None):
-    """Oblicza prawdopodobieństwa dla dodatkowych rynków."""
-    markets = {}
-    
-    # --- Over/Under na gole ---
-    total_goals_dist = np.zeros(matrix.shape[0] + matrix.shape[1])
-    for i in range(matrix.shape[0]):
-        for j in range(matrix.shape[1]):
-            total_goals_dist[i+j] += matrix[i, j]
-    
-    markets['over_0.5'] = round(1 - total_goals_dist[0], 3)
-    markets['over_1.5'] = round(1 - np.sum(total_goals_dist[:2]), 3)
-    markets['over_2.5'] = round(1 - np.sum(total_goals_dist[:3]), 3)
-    markets['over_3.5'] = round(1 - np.sum(total_goals_dist[:4]), 3)
-    markets['over_4.5'] = round(1 - np.sum(total_goals_dist[:5]), 3)
-    
-    # --- Handicap Azjatycki -1.5 (Gospodarz wygrywa różnicą ≥2) ---
-    ah_minus_1_5 = 0
-    for i in range(matrix.shape[0]):
-        for j in range(matrix.shape[1]):
-            if i - 1.5 > j:
-                ah_minus_1_5 += matrix[i, j]
-    markets['ah_home_-1.5'] = round(ah_minus_1_5, 3)
-    
-    # Handicap +1.5 (Goście nie przegrywają różnicą ≥2)
-    markets['ah_away_+1.5'] = round(1 - ah_minus_1_5, 3)
-    
-    # --- BTTS (Both Teams To Score) ---
-    btts = 0
-    for i in range(1, matrix.shape[0]):
-        for j in range(1, matrix.shape[1]):
-            btts += matrix[i, j]
-    markets['btts_yes'] = round(btts, 3)
-    
-    # --- Kartki i rożne (symulacja lub rzeczywiste lambdy) ---
-    # Używamy średnich ligowych, jeśli nie podano konkretnych wartości
-    if lambda_cards is None:
-        lambda_cards = LEAGUE_AVG_CARDS
-    if lambda_corners is None:
-        lambda_corners = LEAGUE_AVG_CORNERS
-    
-    # Over/Under na kartki (suma)
-    markets['over_2.5_cards'] = round(1 - poisson.cdf(2, lambda_cards), 3)
-    markets['over_3.5_cards'] = round(1 - poisson.cdf(3, lambda_cards), 3)
-    markets['over_4.5_cards'] = round(1 - poisson.cdf(4, lambda_cards), 3)
-    markets['over_5.5_cards'] = round(1 - poisson.cdf(5, lambda_cards), 3)
-    
-    # Over/Under na rożne (suma)
-    markets['over_7.5_corners'] = round(1 - poisson.cdf(7, lambda_corners), 3)
-    markets['over_8.5_corners'] = round(1 - poisson.cdf(8, lambda_corners), 3)
-    markets['over_9.5_corners'] = round(1 - poisson.cdf(9, lambda_corners), 3)
-    markets['over_10.5_corners'] = round(1 - poisson.cdf(10, lambda_corners), 3)
-    
-    return markets
+def calculate_handicap(lambda_home, lambda_away, handicap=-1.5):
+    prob = 0
+    for i in range(10):
+        for j in range(10):
+            if i + handicap > j:
+                prob += poisson.pmf(i, lambda_home) * poisson.pmf(j, lambda_away)
+    return round(prob*100,1)
+
+def simulate_cards_corners(style_home, style_away, league):
+    avg = LEAGUE_AVERAGES.get(league, {"cards":3.8, "corners":10.0})
+    lambda_cards = avg["cards"] * style_home * style_away
+    lambda_corners = avg["corners"] * style_home * style_away
+    card_probs = {
+        'over_3.5_cards': round((1-poisson.cdf(3, lambda_cards))*100,1),
+        'over_4.5_cards': round((1-poisson.cdf(4, lambda_cards))*100,1),
+        'over_5.5_cards': round((1-poisson.cdf(5, lambda_cards))*100,1),
+    }
+    corner_probs = {
+        'over_8.5_corners': round((1-poisson.cdf(8, lambda_corners))*100,1),
+        'over_9.5_corners': round((1-poisson.cdf(9, lambda_corners))*100,1),
+        'over_10.5_corners': round((1-poisson.cdf(10, lambda_corners))*100,1),
+    }
+    return card_probs, corner_probs
+
+def generate_coupons(probs, goal_markets, card_probs, corner_probs, handicap_prob, threshold=60):
+    suggestions = []
+    if probs['1'] >= threshold: suggestions.append(("1X2 - Gospodarz", probs['1']))
+    if probs['X'] >= threshold: suggestions.append(("1X2 - Remis", probs['X']))
+    if probs['2'] >= threshold: suggestions.append(("1X2 - Gość", probs['2']))
+    for k, v in goal_markets.items():
+        if v >= threshold:
+            label = k.replace('_', ' ').replace('over', 'Over').replace('.5', '.5 gola')
+            suggestions.append((label, v))
+    if handicap_prob >= threshold:
+        suggestions.append(("Handicap -1.5 (Gospodarz)", handicap_prob))
+    for k, v in card_probs.items():
+        if v >= threshold:
+            label = k.replace('_', ' ').replace('over', 'Over').replace('cards', 'kartek')
+            suggestions.append((label, v))
+    for k, v in corner_probs.items():
+        if v >= threshold:
+            label = k.replace('_', ' ').replace('over', 'Over').replace('corners', 'rożnych')
+            suggestions.append((label, v))
+    return sorted(suggestions, key=lambda x: x[1], reverse=True)[:6]
 
 # ------------------------------
-# 5. GENEROWANIE RAPORTU AI (GEMINI)
+# 4. GENEROWANIE RAPORTU AI (GEMINI)
 # ------------------------------
 def get_available_model(api_key):
     genai.configure(api_key=api_key)
@@ -224,168 +256,144 @@ def get_available_model(api_key):
         pass
     return "models/gemini-2.0-flash-exp"
 
-def generate_llm_report(team_a, team_b, stats_a, stats_b, probs, markets, league, api_key):
+def generate_llm_report(team_a, team_b, stats_a, stats_b, probs, goal_markets, league, api_key):
     if not api_key:
-        return None, "Brak klucza API Gemini."
-    
+        return None
     model_name = get_available_model(api_key)
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
-    
-    prompt = f"""
-Jako ekspert analityki piłkarskiej, przygotuj zwięzły raport w języku polskim dla meczu {team_a} vs {team_b} ({league}).
 
-Dane wejściowe (średnie z ostatnich 5 meczów):
-{team_a}: gole zdobyte={stats_a['avg_xg']:.2f}, gole stracone={stats_a['avg_xga']:.2f}
-{team_b}: gole zdobyte={stats_b['avg_xg']:.2f}, gole stracone={stats_b['avg_xga']:.2f}
+    prompt = f"""
+Jesteś ekspertem od analityki piłkarskiej. Na podstawie poniższych danych przeprowadź analizę meczu {team_a} vs {team_b} w lidze {league}.
+
+Statystyki z ostatnich 5 meczów:
+{team_a}: średnia bramek zdobytych: {stats_a['avg_gf']}, straconych: {stats_a['avg_ga']}
+{team_b}: średnia bramek zdobytych: {stats_b['avg_gf']}, straconych: {stats_b['avg_ga']}
 
 Model Poissona:
-- Prawdopodobieństwa: 1={probs['home_win']:.1f}%, X={probs['draw']:.1f}%, 2={probs['away_win']:.1f}%
-- Najbardziej prawdopodobny wynik: {probs['likely_score']}
-- Oczekiwane gole: {team_a} {probs['lambda_home']:.2f} - {probs['lambda_away']:.2f} {team_b}
+- 1: {probs['1']}%, X: {probs['X']}%, 2: {probs['2']}%
+- Over 2.5 gola: {goal_markets['over_2.5']}%
 
-Wybrane rynki bukmacherskie:
-- BTTS: {markets['btts_yes']*100:.1f}%
-- Over 2.5 gola: {markets['over_2.5']*100:.1f}%
-- Handicap -1.5 dla {team_a}: {markets['ah_home_-1.5']*100:.1f}%
+Napisz zwięzły raport w języku polskim zawierający:
+1. Profil taktyczny (jak drużyny na siebie oddziałują)
+2. Dominujący scenariusz meczu
+3. Margines błędu (czynnik ryzyka)
 
-Struktura raportu:
-1. Profil Taktyczny (2-3 zdania o stylu gry i kluczowych pojedynkach)
-2. Dominujący Scenariusz (najbardziej prawdopodobny przebieg)
-3. Margines Błędu (jeden czynnik ryzyka)
+Używaj stylu profesjonalnego, opartego na danych.
 """
     try:
         response = model.generate_content(prompt)
-        return response.text, None
+        return response.text
     except Exception as e:
-        return None, f"Błąd API Gemini: {e}"
+        return f"Błąd generowania raportu: {e}"
 
 # ------------------------------
-# 6. INTERFEJS UŻYTKOWNIKA
+# 5. INTERFEJS UŻYTKOWNIKA
 # ------------------------------
 with st.sidebar:
     st.header("🔑 Klucze API")
-    gemini_key = st.text_input("Klucz Gemini (opcjonalny)", type="password")
-    st.caption("[Zdobądź klucz Gemini](https://aistudio.google.com/app/apikey)")
-    
-    football_api_key = st.text_input("Klucz Football-Data.org", type="password")
-    st.caption("[Zdobądź darmowy klucz](https://www.football-data.org/client/register)")
-    
+    fd_key = st.text_input("Football-Data.org Key", type="password")
+    api_key = st.text_input("API-Football Key (opcjonalny)", type="password")
+    gemini_key = st.text_input("Google Gemini Key (opcjonalny)", type="password")
+    st.caption("[Football-Data](https://www.football-data.org/) | [API-Football](https://www.api-football.com/) | [Gemini](https://aistudio.google.com/)")
     st.divider()
-    st.header("⚙️ Ustawienia")
-    use_ai_report = st.checkbox("Generuj raport AI", value=True)
-    
+    st.header("⚙️ Styl gry")
+    style_h = st.slider("Agresywność gospodarzy", 0.7, 1.3, 1.0, 0.05)
+    style_a = st.slider("Agresywność gości", 0.7, 1.3, 1.0, 0.05)
     st.divider()
-    st.markdown("**Uwaga**: Kartki i rożne są symulowane na podstawie średnich ligowych. Aby użyć rzeczywistych danych, wymagane jest płatne API.")
+    threshold = st.slider("Próg pewności kuponów (%)", 50, 90, 65, 5)
 
-# Główny panel
 col1, col2 = st.columns(2)
 with col1:
-    team_a = st.text_input("🏠 DRUŻYNA A (Gospodarz)", "Manchester City")
+    team_a = st.text_input("🏠 DRUŻYNA A", "Paris Saint-Germain")
 with col2:
-    team_b = st.text_input("✈️ DRUŻYNA B (Goście)", "Arsenal")
+    team_b = st.text_input("✈️ DRUŻYNA B", "Olympique Lyonnais")
 
-league = st.selectbox("🏆 Liga", list(LEAGUE_MAP.keys()))
+league = st.selectbox("🏆 Liga", list(LEAGUE_MAP_FD.keys()))
 
-if st.button("🚀 Wykonaj Pełną Analizę", type="primary"):
-    if not football_api_key:
-        st.error("❌ Klucz API Football-Data.org jest wymagany!")
+if st.button("🚀 Analizuj mecz", type="primary"):
+    if not fd_key:
+        st.error("❌ Podaj klucz Football-Data.org")
     else:
-        league_code = LEAGUE_MAP[league]
-        
-        with st.spinner(f"Pobieram dane dla {team_a}..."):
-            data_a, err_a = fetch_team_stats(team_a, league_code, football_api_key)
-        with st.spinner(f"Pobieram dane dla {team_b}..."):
-            data_b, err_b = fetch_team_stats(team_b, league_code, football_api_key)
-        
-        if err_a or err_b:
-            if err_a: st.error(f"{team_a}: {err_a}")
-            if err_b: st.error(f"{team_b}: {err_b}")
-        elif data_a and data_b:
-            factor = LEAGUE_FACTORS.get(league, 1.0)
-            probs = calculate_match_probs(
-                data_a['avg_xg'], data_b['avg_xg'],
-                data_a['avg_xga'], data_b['avg_xga'], factor
-            )
-            
-            markets = calculate_markets(
-                probs['goal_matrix'],
-                probs['lambda_home'],
-                probs['lambda_away']
-            )
-            
-            # Raport AI
-            ai_report = None
-            if gemini_key and use_ai_report:
-                with st.spinner("🤖 Gemini pisze raport..."):
-                    ai_report, ai_err = generate_llm_report(
-                        team_a, team_b, data_a, data_b, probs, markets, league, gemini_key
-                    )
-                    if ai_err:
-                        st.error(ai_err)
-            
-            # Wyświetlanie wyników
-            st.divider()
-            st.header(f"📊 Analiza: {team_a} vs {team_b}")
-            
-            if ai_report:
-                st.markdown("### 🧠 Raport AI")
-                st.markdown(ai_report)
-            
-            # Podstawowe statystyki
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric(f"{team_a} śr. gole zdobyte", data_a['avg_xg'])
-            col2.metric(f"{team_b} śr. gole zdobyte", data_b['avg_xg'])
-            col3.metric(f"{team_a} śr. gole stracone", data_a['avg_xga'])
-            col4.metric(f"{team_b} śr. gole stracone", data_b['avg_xga'])
-            
-            # Model Poissona (gole)
-            st.subheader("🎲 Prawdopodobieństwa wyniku (1X2)")
-            pcol1, pcol2, pcol3 = st.columns(3)
-            pcol1.metric("🏠 Wygrana Gospodarzy", f"{probs['home_win']}%")
-            pcol2.metric("🤝 Remis", f"{probs['draw']}%")
-            pcol3.metric("✈️ Wygrana Gości", f"{probs['away_win']}%")
-            st.info(f"**Najbardziej prawdopodobny wynik:** {probs['likely_score']} (λ: {probs['lambda_home']} - {probs['lambda_away']})")
-            
-            # Rynki bukmacherskie
-            st.subheader("🎯 Dodatkowe rynki (prawdopodobieństwa)")
-            
-            tab1, tab2, tab3, tab4 = st.tabs(["Gole Over/Under", "Handicap & BTTS", "Kartki (sym.)", "Rożne (sym.)"])
-            
-            with tab1:
-                cols = st.columns(4)
-                cols[0].metric("Over 0.5", f"{markets['over_0.5']*100:.1f}%")
-                cols[1].metric("Over 1.5", f"{markets['over_1.5']*100:.1f}%")
-                cols[2].metric("Over 2.5", f"{markets['over_2.5']*100:.1f}%")
-                cols[3].metric("Over 3.5", f"{markets['over_3.5']*100:.1f}%")
-                st.caption("Over 4.5: {:.1f}%".format(markets['over_4.5']*100))
-            
-            with tab2:
-                cols = st.columns(3)
-                cols[0].metric(f"Handicap -1.5 ({team_a})", f"{markets['ah_home_-1.5']*100:.1f}%")
-                cols[1].metric(f"Handicap +1.5 ({team_b})", f"{markets['ah_away_+1.5']*100:.1f}%")
-                cols[2].metric("BTTS (obie strzelą)", f"{markets['btts_yes']*100:.1f}%")
-            
-            with tab3:
-                st.caption("Symulacja na podstawie średniej ligowej (ok. 3.8 kartki/mecz)")
-                cols = st.columns(4)
-                cols[0].metric("Over 2.5", f"{markets['over_2.5_cards']*100:.1f}%")
-                cols[1].metric("Over 3.5", f"{markets['over_3.5_cards']*100:.1f}%")
-                cols[2].metric("Over 4.5", f"{markets['over_4.5_cards']*100:.1f}%")
-                cols[3].metric("Over 5.5", f"{markets['over_5.5_cards']*100:.1f}%")
-            
-            with tab4:
-                st.caption("Symulacja na podstawie średniej ligowej (ok. 9.5 rożnego/mecz)")
-                cols = st.columns(4)
-                cols[0].metric("Over 7.5", f"{markets['over_7.5_corners']*100:.1f}%")
-                cols[1].metric("Over 8.5", f"{markets['over_8.5_corners']*100:.1f}%")
-                cols[2].metric("Over 9.5", f"{markets['over_9.5_corners']*100:.1f}%")
-                cols[3].metric("Over 10.5", f"{markets['over_10.5_corners']*100:.1f}%")
-            
-            # Ostatnie mecze
-            if not data_a['recent_form'].empty:
-                st.subheader(f"📋 Ostatnie mecze {team_a}")
-                st.dataframe(data_a['recent_form'], hide_index=True)
-            if not data_b['recent_form'].empty:
-                st.subheader(f"📋 Ostatnie mecze {team_b}")
-                st.dataframe(data_b['recent_form'], hide_index=True)
+        with st.spinner("Pobieram dane..."):
+            stats_a = fetch_team_stats_fd(team_a, LEAGUE_MAP_FD[league], fd_key)
+            stats_b = fetch_team_stats_fd(team_b, LEAGUE_MAP_FD[league], fd_key)
+
+        if stats_a is None or stats_b is None:
+            st.stop()
+
+        strength_a, strength_b = 1.0, 1.0
+        if api_key:
+            fixture_id = get_upcoming_fixture(team_a, team_b, LEAGUE_MAP_API[league], api_key)
+            if fixture_id:
+                lineup_a = fetch_lineup(fixture_id, team_a, api_key)
+                lineup_b = fetch_lineup(fixture_id, team_b, api_key)
+                strength_a = calculate_lineup_strength(lineup_a, KEY_PLAYERS.get(team_a, []))
+                strength_b = calculate_lineup_strength(lineup_b, KEY_PLAYERS.get(team_b, []))
+                if strength_a < 0.9:
+                    st.warning(f"⚠️ {team_a} gra osłabionym składem (siła {strength_a*100:.0f}%)")
+                if strength_b < 0.9:
+                    st.warning(f"⚠️ {team_b} gra osłabionym składem (siła {strength_b*100:.0f}%)")
+
+        # Obliczenia
+        lambda_home = (stats_a['avg_gf'] + stats_b['avg_ga']) / 2 * LEAGUE_FACTORS[league] * strength_a
+        lambda_away = (stats_b['avg_gf'] + stats_a['avg_ga']) / 2 * LEAGUE_FACTORS[league] * strength_b
+
+        probs_1x2 = calculate_match_probs(lambda_home, lambda_away)
+        goal_markets = calculate_goal_markets(lambda_home, lambda_away)
+        handicap_prob = calculate_handicap(lambda_home, lambda_away)
+        card_probs, corner_probs = simulate_cards_corners(style_h, style_a, league)
+
+        # Raport AI
+        if gemini_key:
+            with st.spinner("🤖 Gemini pisze raport..."):
+                ai_report = generate_llm_report(team_a, team_b, stats_a, stats_b, probs_1x2, goal_markets, league, gemini_key)
+                if ai_report:
+                    st.markdown("### 🧠 Analiza AI")
+                    st.markdown(ai_report)
+
+        st.divider()
+        st.header(f"📊 {team_a} vs {team_b}")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("1", f"{probs_1x2['1']}%")
+        c2.metric("X", f"{probs_1x2['X']}%")
+        c3.metric("2", f"{probs_1x2['2']}%")
+
+        st.subheader("🎯 Over/Under Gole")
+        g1, g2, g3, g4, g5 = st.columns(5)
+        g1.metric("O 0.5", f"{goal_markets['over_0.5']}%")
+        g2.metric("O 1.5", f"{goal_markets['over_1.5']}%")
+        g3.metric("O 2.5", f"{goal_markets['over_2.5']}%")
+        g4.metric("O 3.5", f"{goal_markets['over_3.5']}%")
+        g5.metric("O 4.5", f"{goal_markets['over_4.5']}%")
+
+        st.subheader("⚖️ Handicap")
+        st.metric("Gospodarz -1.5", f"{handicap_prob}%")
+
+        st.subheader("🟨 Kartki")
+        k1, k2, k3 = st.columns(3)
+        k1.metric("O 3.5", f"{card_probs['over_3.5_cards']}%")
+        k2.metric("O 4.5", f"{card_probs['over_4.5_cards']}%")
+        k3.metric("O 5.5", f"{card_probs['over_5.5_cards']}%")
+
+        st.subheader("🚩 Rożne")
+        r1, r2, r3 = st.columns(3)
+        r1.metric("O 8.5", f"{corner_probs['over_8.5_corners']}%")
+        r2.metric("O 9.5", f"{corner_probs['over_9.5_corners']}%")
+        r3.metric("O 10.5", f"{corner_probs['over_10.5_corners']}%")
+
+        # Kupony
+        coupons = generate_coupons(probs_1x2, goal_markets, card_probs, corner_probs, handicap_prob, threshold)
+        if coupons:
+            st.subheader(f"🎫 Sugerowane kupony (próg {threshold}%)")
+            c_cols = st.columns(min(len(coupons), 3))
+            for i, (label, prob) in enumerate(coupons):
+                with c_cols[i % 3]:
+                    st.metric(label=label, value=f"{prob:.1f}%", delta="Wysoka szansa")
+
+        # Ostatnie mecze
+        st.subheader(f"📋 Ostatnie 5 meczów {team_a}")
+        st.dataframe(stats_a['recent_form'], hide_index=True)
+        st.subheader(f"📋 Ostatnie 5 meczów {team_b}")
+        st.dataframe(stats_b['recent_form'], hide_index=True)
